@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	_ "strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -14,9 +13,9 @@ import (
 
 // Config структура для конфигурации
 type Config struct {
-	WatchPath   string `json:"watch_path"`
-	LogFile     string `json:"log_file"`
-	MaxFileSize int64  `json:"max_file_size"`
+	WatchPaths  []string `json:"watch_paths"`
+	LogFile     string   `json:"log_file"`
+	MaxFileSize int64    `json:"max_file_size"`
 }
 
 // LogEntry структура для записи лога
@@ -44,8 +43,10 @@ func main() {
 	}
 	defer logFile.Close()
 
-	logger.Println("=== Запуск мониторинга папки ===")
-	logger.Printf("Мониторинг папки: %s\n", config.WatchPath)
+	logger.Println("=== Запуск мониторинга папок ===")
+	for _, path := range config.WatchPaths {
+		logger.Printf("Мониторинг папки: %s\n", path)
+	}
 	logger.Printf("Лог файл: %s\n", config.LogFile)
 
 	// Создаем watcher
@@ -55,30 +56,37 @@ func main() {
 	}
 	defer watcher.Close()
 
-	// Добавляем папку для мониторинга
-	err = watcher.Add(config.WatchPath)
-	if err != nil {
-		logger.Fatal("Ошибка добавления папки:", err)
-	}
-
-	// Также мониторим вложенные папки
-	err = filepath.Walk(config.WatchPath, func(path string, info os.FileInfo, err error) error {
+	// Добавляем все папки для мониторинга
+	for _, watchPath := range config.WatchPaths {
+		// Добавляем основную папку для мониторинга
+		err = watcher.Add(watchPath)
 		if err != nil {
-			return err
+			logger.Printf("Ошибка добавления папки %s: %v\n", watchPath, err)
+			continue
 		}
-		if info.IsDir() {
-			err = watcher.Add(path)
+
+		// Также мониторим вложенные папки
+		err = filepath.Walk(watchPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				logger.Printf("Ошибка добавления подпапки %s: %v\n", path, err)
+				return err
 			}
+			if info.IsDir() {
+				err = watcher.Add(path)
+				if err != nil {
+					logger.Printf("Ошибка добавления подпапки %s: %v\n", path, err)
+				} else {
+					logger.Printf("Добавлена подпапка: %s\n", path)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			logger.Printf("Ошибка обхода папок %s: %v\n", watchPath, err)
 		}
-		return nil
-	})
-	if err != nil {
-		logger.Printf("Ошибка обхода папок: %v\n", err)
 	}
 
 	logger.Println("Мониторинг запущен. Ожидание событий...")
+	fmt.Println("Мониторинг запущен. События записываются в:", config.LogFile)
 
 	// Обработка событий
 	for {
@@ -92,7 +100,12 @@ func main() {
 			if isDirectory(event.Name) {
 				// Если создана новая папка, добавляем её в мониторинг
 				if event.Op&fsnotify.Create == fsnotify.Create {
-					watcher.Add(event.Name)
+					err := watcher.Add(event.Name)
+					if err != nil {
+						logger.Printf("Ошибка добавления новой папки %s: %v\n", event.Name, err)
+					} else {
+						logger.Printf("Добавлена новая папка для мониторинга: %s\n", event.Name)
+					}
 				}
 				continue
 			}
@@ -111,13 +124,21 @@ func main() {
 
 func initConfig() {
 	config = Config{
-		WatchPath:   `C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`,
+		WatchPaths: []string{
+			`C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`,
+		},
 		LogFile:     `C:\EVRIMA\file_monitor.log`,
 		MaxFileSize: 10 * 1024 * 1024, // 10MB максимальный размер файла для чтения
 	}
 
-	// Создаем папку для мониторинга если её нет
-	os.MkdirAll(config.WatchPath, 0755)
+	// Создаем папки для мониторинга если их нет
+	for _, watchPath := range config.WatchPaths {
+		os.MkdirAll(watchPath, 0755)
+	}
+
+	// Создаем директорию для лог файла если её нет
+	logDir := filepath.Dir(config.LogFile)
+	os.MkdirAll(logDir, 0755)
 }
 
 func initLogger() error {
@@ -142,6 +163,9 @@ func isDirectory(path string) bool {
 func handleFileEvent(event fsnotify.Event) {
 	filename := event.Name
 	var logEntry LogEntry
+
+	// Добавляем небольшую задержку для обработки файлов, которые могут быть заблокированы
+	time.Sleep(100 * time.Millisecond)
 
 	switch {
 	case event.Op&fsnotify.Create == fsnotify.Create:

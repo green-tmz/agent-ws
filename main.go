@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -19,6 +20,8 @@ const (
 	apiURL        = "https://admin.twod.club/api/get-event"
 	checkInterval = 2 * time.Second
 	logFile       = `C:\EVRIMA\file_watcher.log`
+	maxRetries    = 3
+	retryDelay    = 2 * time.Second
 )
 
 type EventData struct {
@@ -35,19 +38,29 @@ type ApiResponse struct {
 	EventType  string `json:"event_type"`
 	SteamID    string `json:"steam_id"`
 	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
+	IsHTML     bool   `json:"is_html"`
 }
 
 var (
 	fileLogger    *log.Logger
 	logFileHandle *os.File
+	httpClient    *http.Client
+	fileCache     map[string]string // Кэш для хранения содержимого файлов
 )
 
 func main() {
+	// Инициализация кэша
+	fileCache = make(map[string]string)
+
 	// Инициализация логгера
 	if err := initLogger(); err != nil {
 		log.Fatal("Error initializing logger:", err)
 	}
 	defer logFileHandle.Close()
+
+	// Инициализация HTTP клиента
+	initHTTPClient()
 
 	fileLogger.Println("=== Starting file watcher ===")
 	fileLogger.Printf("Watch path: %s", watchPath)
@@ -117,6 +130,17 @@ func initLogger() error {
 	return nil
 }
 
+func initHTTPClient() {
+	httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+
 func initFileStates(fileStates map[string]time.Time) {
 	files, err := os.ReadDir(watchPath)
 	if err != nil {
@@ -129,6 +153,12 @@ func initFileStates(fileStates map[string]time.Time) {
 			fullPath := filepath.Join(watchPath, file.Name())
 			if info, err := os.Stat(fullPath); err == nil {
 				fileStates[fullPath] = info.ModTime()
+				// Кэшируем содержимое существующих файлов
+				content, err := readFileContent(fullPath)
+				if err == nil {
+					fileCache[fullPath] = content
+					fileLogger.Printf("Cached content for file: %s", filepath.Base(fullPath))
+				}
 			}
 		}
 	}
@@ -173,14 +203,17 @@ func handleFileCreate(filename, steamID string, fileStates map[string]time.Time)
 		return
 	}
 
+	// Кэшируем содержимое
+	fileCache[filename] = content
+
 	eventData := EventData{
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "add-dino-data",
-		Data:      content,
+		Data:      ensureValidData(content),
 	}
 
-	sendEvent(eventData)
+	sendEventWithRetry(eventData)
 	fileStates[filename] = time.Now()
 }
 
@@ -203,14 +236,17 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 		return
 	}
 
+	// Обновляем кэш
+	fileCache[filename] = content
+
 	eventData := EventData{
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "change-dino-data",
-		Data:      content,
+		Data:      ensureValidData(content),
 	}
 
-	sendEvent(eventData)
+	sendEventWithRetry(eventData)
 
 	// Обновляем время модификации
 	if info, err := os.Stat(filename); err == nil {
@@ -219,21 +255,20 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 }
 
 func handleFileRemove(filename, steamID string, fileStates map[string]time.Time) {
-	// Для удаленных файлов мы не можем прочитать содержимое,
-	// но можем использовать кэшированное содержимое если оно есть
-	var content string
-	if cachedContent, exists := getCachedContent(filename); exists {
-		content = cachedContent
-	}
+	// Для удаленных файлов используем кэшированное содержимое
+	content := getCachedContent(filename)
 
 	eventData := EventData{
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "delete-dino-data",
-		Data:      content,
+		Data:      ensureValidData(content),
 	}
 
-	sendEvent(eventData)
+	sendEventWithRetry(eventData)
+
+	// Удаляем из кэша и состояний
+	delete(fileCache, filename)
 	delete(fileStates, filename)
 }
 
@@ -267,35 +302,86 @@ func readFileContent(filename string) (string, error) {
 	return string(content), nil
 }
 
-// Простая кэш-функция для хранения содержимого файлов
-func getCachedContent(filename string) (string, bool) {
-	// Здесь можно реализовать кэширование содержимого файлов
-	// Для простоты возвращаем пустую строку
-	return "", false
+// Получаем кэшированное содержимое файла
+func getCachedContent(filename string) string {
+	if content, exists := fileCache[filename]; exists {
+		return content
+	}
+	return "" // Возвращаем пустую строку вместо null
 }
 
-func sendEvent(eventData EventData) {
+// Гарантируем, что данные всегда будут валидными (не null)
+func ensureValidData(data string) string {
+	if data == "" {
+		return "{}" // Возвращаем пустой JSON объект вместо пустой строки
+	}
+
+	// Проверяем, является ли data валидным JSON
+	var js map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &js); err != nil {
+		// Если не валидный JSON, оборачиваем в JSON строку
+		return fmt.Sprintf(`{"raw_data": %q}`, data)
+	}
+
+	return data
+}
+
+func sendEventWithRetry(eventData EventData) {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		apiResponse := sendEvent(eventData)
+
+		if apiResponse.Success {
+			return // Успешно отправлено
+		}
+
+		// Если получили HTML вместо JSON, прерываем попытки
+		if apiResponse.IsHTML {
+			fileLogger.Printf("API returned HTML page (likely authentication required), stopping retries for SteamID %s", eventData.SteamID64)
+			return
+		}
+
+		if attempt < maxRetries {
+			fileLogger.Printf("Attempt %d failed for SteamID %s, retrying in %v...", attempt, eventData.SteamID64, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	fileLogger.Printf("All %d attempts failed for SteamID %s", maxRetries, eventData.SteamID64)
+}
+
+func sendEvent(eventData EventData) ApiResponse {
 	jsonData, err := json.Marshal(eventData)
 	if err != nil {
 		fileLogger.Printf("Error marshaling JSON: %v", err)
-		return
+		return ApiResponse{
+			Timestamp: time.Now().Format(time.RFC3339),
+			EventType: eventData.Event,
+			SteamID:   eventData.SteamID64,
+			Success:   false,
+			Error:     fmt.Sprintf("JSON marshal error: %v", err),
+		}
 	}
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		fileLogger.Printf("Error creating request: %v", err)
-		return
+		return ApiResponse{
+			Timestamp: time.Now().Format(time.RFC3339),
+			EventType: eventData.Event,
+			SteamID:   eventData.SteamID64,
+			Success:   false,
+			Error:     fmt.Sprintf("Request creation error: %v", err),
+		}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "FileWatcher/1.0")
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// Добавляем заголовки для предотвращения кэширования
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
 
 	startTime := time.Now()
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	responseTime := time.Since(startTime)
 
 	apiResponse := ApiResponse{
@@ -306,42 +392,78 @@ func sendEvent(eventData EventData) {
 
 	if err != nil {
 		apiResponse.Success = false
-		apiResponse.Body = err.Error()
-		logApiResponse(apiResponse)
-		fileLogger.Printf("Error sending request: %v", err)
-		return
+		apiResponse.Error = err.Error()
+		logApiResponse(apiResponse, responseTime)
+		return apiResponse
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Проверяем, является ли ответ HTML
+	isHTML := strings.Contains(bodyStr, "<!DOCTYPE html>") ||
+		strings.Contains(bodyStr, "<html") ||
+		strings.Contains(bodyStr, "Steam") ||
+		strings.Contains(bodyStr, "Sign In")
 
 	apiResponse.StatusCode = resp.StatusCode
-	apiResponse.Body = string(body)
-	apiResponse.Success = resp.StatusCode >= 200 && resp.StatusCode < 300
+	apiResponse.Body = truncateBody(bodyStr)
+	apiResponse.Success = resp.StatusCode >= 200 && resp.StatusCode < 300 && !isHTML
+	apiResponse.IsHTML = isHTML
+
+	if isHTML {
+		apiResponse.Error = "Server returned HTML page instead of JSON (likely authentication required or wrong endpoint)"
+	}
 
 	// Логируем результат отправки
-	logApiResponse(apiResponse)
+	logApiResponse(apiResponse, responseTime)
 
 	if apiResponse.Success {
 		fileLogger.Printf("Successfully sent event %s for SteamID %s (Response time: %v, Status: %d)",
 			eventData.Event, eventData.SteamID64, responseTime, resp.StatusCode)
 		log.Printf("Successfully sent event %s for SteamID %s", eventData.Event, eventData.SteamID64)
 	} else {
-		fileLogger.Printf("Error response from server for SteamID %s: %d - %s (Response time: %v)",
-			eventData.SteamID64, resp.StatusCode, string(body), responseTime)
-		log.Printf("Error response from server: %d - %s", resp.StatusCode, string(body))
+		if apiResponse.IsHTML {
+			fileLogger.Printf("API returned HTML page for SteamID %s: %d - Response contains Steam login page (Response time: %v)",
+				eventData.SteamID64, resp.StatusCode, responseTime)
+			log.Printf("API returned Steam login page for SteamID %s - check API endpoint and authentication", eventData.SteamID64)
+		} else {
+			fileLogger.Printf("Error response from server for SteamID %s: %d - %s (Response time: %v)",
+				eventData.SteamID64, resp.StatusCode, truncateBody(bodyStr), responseTime)
+			log.Printf("Error response from server: %d - %s", resp.StatusCode, truncateBody(bodyStr))
+		}
 	}
+
+	return apiResponse
 }
 
-func logApiResponse(response ApiResponse) {
+func truncateBody(body string) string {
+	if len(body) > 500 {
+		return body[:500] + "... [truncated]"
+	}
+	return body
+}
+
+func logApiResponse(response ApiResponse, responseTime time.Duration) {
 	// Форматируем ответ для лога
+	status := "SUCCESS"
+	if !response.Success {
+		status = "ERROR"
+		if response.IsHTML {
+			status = "HTML_RESPONSE"
+		}
+	}
+
 	logEntry := fmt.Sprintf(
-		"API_RESPONSE | Time: %s | Event: %s | SteamID: %s | Status: %d | Success: %t | Response: %s",
+		"API_RESPONSE | Status: %s | Time: %s | Event: %s | SteamID: %s | HTTP: %d | ResponseTime: %v | Error: %s | Body: %s",
+		status,
 		response.Timestamp,
 		response.EventType,
 		response.SteamID,
 		response.StatusCode,
-		response.Success,
+		responseTime,
+		response.Error,
 		response.Body,
 	)
 
@@ -349,10 +471,13 @@ func logApiResponse(response ApiResponse) {
 
 	// Также выводим в консоль для удобства мониторинга
 	if response.Success {
-		log.Printf("API Success - Event: %s, SteamID: %s, Status: %d",
+		log.Printf("API Success - Event: %s, SteamID: %s, Status: %d, Time: %v",
+			response.EventType, response.SteamID, response.StatusCode, responseTime)
+	} else if response.IsHTML {
+		log.Printf("API HTML Response - Event: %s, SteamID: %s, Status: %d - Server returned Steam login page",
 			response.EventType, response.SteamID, response.StatusCode)
 	} else {
-		log.Printf("API Error - Event: %s, SteamID: %s, Status: %d, Response: %s",
-			response.EventType, response.SteamID, response.StatusCode, response.Body)
+		log.Printf("API Error - Event: %s, SteamID: %s, Status: %d, Error: %s",
+			response.EventType, response.SteamID, response.StatusCode, response.Error)
 	}
 }

@@ -157,7 +157,9 @@ func initFileStates(fileStates map[string]time.Time) {
 				content, err := readFileContent(fullPath)
 				if err == nil {
 					fileCache[fullPath] = content
-					fileLogger.Printf("Cached content for file: %s", filepath.Base(fullPath))
+					fileLogger.Printf("Cached content for file: %s, Content: %s", filepath.Base(fullPath), truncateBody(content))
+				} else {
+					fileLogger.Printf("Error caching file %s: %v", filepath.Base(fullPath), err)
 				}
 			}
 		}
@@ -213,6 +215,7 @@ func handleFileCreate(filename, steamID string, fileStates map[string]time.Time)
 		Data:      ensureValidData(content),
 	}
 
+	fileLogger.Printf("Sending create event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
 	sendEventWithRetry(eventData)
 	fileStates[filename] = time.Now()
 }
@@ -246,6 +249,7 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 		Data:      ensureValidData(content),
 	}
 
+	fileLogger.Printf("Sending change event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
 	sendEventWithRetry(eventData)
 
 	// Обновляем время модификации
@@ -265,6 +269,7 @@ func handleFileRemove(filename, steamID string, fileStates map[string]time.Time)
 		Data:      ensureValidData(content),
 	}
 
+	fileLogger.Printf("Sending delete event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
 	sendEventWithRetry(eventData)
 
 	// Удаляем из кэша и состояний
@@ -312,17 +317,22 @@ func getCachedContent(filename string) string {
 
 // Гарантируем, что данные всегда будут валидными (не null)
 func ensureValidData(data string) string {
-	if data == "" {
-		return "{}" // Возвращаем пустой JSON объект вместо пустой строки
+	// Если данные пустые, возвращаем пустой JSON объект
+	if strings.TrimSpace(data) == "" {
+		return "{}"
 	}
 
-	// Проверяем, является ли data валидным JSON
-	var js map[string]interface{}
+	// Пробуем распарсить как JSON чтобы проверить валидность
+	var js json.RawMessage
 	if err := json.Unmarshal([]byte(data), &js); err != nil {
-		// Если не валидный JSON, оборачиваем в JSON строку
-		return fmt.Sprintf(`{"raw_data": %q}`, data)
+		// Если не валидный JSON, логируем ошибку и возвращаем как JSON строку
+		fileLogger.Printf("Data is not valid JSON, wrapping as string. Error: %v, Data: %s", err, truncateBody(data))
+		// Экранируем и возвращаем как JSON строку
+		escapedData := strings.ReplaceAll(data, `"`, `\"`)
+		return `"` + escapedData + `"`
 	}
 
+	// Если валидный JSON, возвращаем как есть
 	return data
 }
 

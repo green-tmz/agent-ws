@@ -16,12 +16,14 @@ import (
 )
 
 const (
-	watchPath     = `C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`
-	apiURL        = "https://admin.twod.club/api/get-event"
-	checkInterval = 2 * time.Second
-	logFile       = `C:\EVRIMA\file_watcher.log`
-	maxRetries    = 3
-	retryDelay    = 2 * time.Second
+	watchPath       = `C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`
+	apiURL          = "https://admin.twod.club/api/get-event"
+	checkInterval   = 2 * time.Second
+	logFile         = `C:\EVRIMA\file_watcher.log`
+	maxRetries      = 3
+	retryDelay      = 2 * time.Second
+	fileReadRetries = 5
+	fileReadDelay   = 500 * time.Millisecond
 )
 
 type EventData struct {
@@ -154,11 +156,11 @@ func initFileStates(fileStates map[string]time.Time) {
 			if info, err := os.Stat(fullPath); err == nil {
 				fileStates[fullPath] = info.ModTime()
 				// Кэшируем содержимое существующих файлов
-				content, err := readFileContent(fullPath)
+				content, err := readFileContentWithRetry(fullPath)
 				if err == nil {
 					fileCache[fullPath] = content
-					fileLogger.Printf("Cached content for file: %s, Size: %d bytes, Content: %s",
-						filepath.Base(fullPath), len(content), truncateBody(content))
+					fileLogger.Printf("Cached content for file: %s, Size: %d bytes",
+						filepath.Base(fullPath), len(content))
 				} else {
 					fileLogger.Printf("Error caching file %s: %v", filepath.Base(fullPath), err)
 				}
@@ -187,11 +189,13 @@ func handleFileEvent(event fsnotify.Event, fileStates map[string]time.Time) {
 
 	switch {
 	case event.Op&fsnotify.Create == fsnotify.Create:
-		// Небольшая задержка для гарантии что файл полностью записан
-		time.Sleep(100 * time.Millisecond)
+		// Для создания файла даем больше времени на запись
+		time.Sleep(1 * time.Second)
 		handleFileCreate(filename, steamID, fileStates)
 
 	case event.Op&fsnotify.Write == fsnotify.Write:
+		// Для изменения файла даем время на завершение записи
+		time.Sleep(500 * time.Millisecond)
 		handleFileWrite(filename, steamID, fileStates)
 
 	case event.Op&fsnotify.Remove == fsnotify.Remove:
@@ -200,9 +204,9 @@ func handleFileEvent(event fsnotify.Event, fileStates map[string]time.Time) {
 }
 
 func handleFileCreate(filename, steamID string, fileStates map[string]time.Time) {
-	content, err := readFileContent(filename)
+	content, err := readFileContentWithRetry(filename)
 	if err != nil {
-		fileLogger.Printf("Error reading created file %s: %v", filename, err)
+		fileLogger.Printf("Error reading created file %s after retries: %v", filename, err)
 		return
 	}
 
@@ -213,11 +217,11 @@ func handleFileCreate(filename, steamID string, fileStates map[string]time.Time)
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "add-dino-data",
-		Data:      content, // Отправляем оригинальное содержимое без изменений
+		Data:      content,
 	}
 
-	fileLogger.Printf("Sending create event for SteamID %s, File size: %d bytes, Data: %s",
-		steamID, len(content), truncateBody(content))
+	fileLogger.Printf("Sending create event for SteamID %s, File size: %d bytes",
+		steamID, len(content))
 	sendEventWithRetry(eventData)
 	fileStates[filename] = time.Now()
 }
@@ -235,9 +239,9 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 		return
 	}
 
-	content, err := readFileContent(filename)
+	content, err := readFileContentWithRetry(filename)
 	if err != nil {
-		fileLogger.Printf("Error reading modified file %s: %v", filename, err)
+		fileLogger.Printf("Error reading modified file %s after retries: %v", filename, err)
 		return
 	}
 
@@ -248,11 +252,11 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "change-dino-data",
-		Data:      content, // Отправляем оригинальное содержимое без изменений
+		Data:      content,
 	}
 
-	fileLogger.Printf("Sending change event for SteamID %s, File size: %d bytes, Data: %s",
-		steamID, len(content), truncateBody(content))
+	fileLogger.Printf("Sending change event for SteamID %s, File size: %d bytes",
+		steamID, len(content))
 	sendEventWithRetry(eventData)
 
 	// Обновляем время модификации
@@ -269,11 +273,11 @@ func handleFileRemove(filename, steamID string, fileStates map[string]time.Time)
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "delete-dino-data",
-		Data:      content, // Отправляем кэшированное содержимое
+		Data:      content,
 	}
 
-	fileLogger.Printf("Sending delete event for SteamID %s, Cached data size: %d bytes, Data: %s",
-		steamID, len(content), truncateBody(content))
+	fileLogger.Printf("Sending delete event for SteamID %s, Cached data size: %d bytes",
+		steamID, len(content))
 	sendEventWithRetry(eventData)
 
 	// Удаляем из кэша и состояний
@@ -303,6 +307,39 @@ func getSteamIDFromFilename(filename string) string {
 	return base[:len(base)-len(ext)]
 }
 
+func readFileContentWithRetry(filename string) (string, error) {
+	var content string
+	var err error
+
+	for attempt := 1; attempt <= fileReadRetries; attempt++ {
+		content, err = readFileContent(filename)
+		if err == nil && content != "" {
+			// Успешно прочитали непустой файл
+			fileLogger.Printf("Successfully read file %s on attempt %d, Size: %d bytes",
+				filepath.Base(filename), attempt, len(content))
+			return content, nil
+		}
+
+		if attempt < fileReadRetries {
+			if err != nil {
+				fileLogger.Printf("Attempt %d failed for file %s: %v, retrying...",
+					attempt, filepath.Base(filename), err)
+			} else {
+				fileLogger.Printf("Attempt %d: file %s is empty, retrying...",
+					attempt, filepath.Base(filename))
+			}
+			time.Sleep(fileReadDelay)
+		}
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %s after %d attempts: %v",
+			filepath.Base(filename), fileReadRetries, err)
+	}
+	return "", fmt.Errorf("file %s is still empty after %d attempts",
+		filepath.Base(filename), fileReadRetries)
+}
+
 func readFileContent(filename string) (string, error) {
 	// Сначала проверяем размер файла
 	info, err := os.Stat(filename)
@@ -310,11 +347,8 @@ func readFileContent(filename string) (string, error) {
 		return "", fmt.Errorf("stat error: %v", err)
 	}
 
-	fileLogger.Printf("Reading file: %s, Size: %d bytes", filepath.Base(filename), info.Size())
-
 	// Если файл пустой, возвращаем пустую строку
 	if info.Size() == 0 {
-		fileLogger.Printf("File %s is empty", filepath.Base(filename))
 		return "", nil
 	}
 
@@ -323,19 +357,7 @@ func readFileContent(filename string) (string, error) {
 		return "", fmt.Errorf("read error: %v", err)
 	}
 
-	// Логируем первые 100 байт для отладки
-	if len(content) > 0 {
-		fileLogger.Printf("File %s first 100 bytes: %q", filepath.Base(filename), string(content[:min(100, len(content))]))
-	}
-
 	return string(content), nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // Получаем кэшированное содержимое файла
@@ -391,9 +413,6 @@ func sendEvent(eventData EventData) ApiResponse {
 			Error:     fmt.Sprintf("JSON marshal error: %v", err),
 		}
 	}
-
-	// Логируем полный JSON для отладки
-	fileLogger.Printf("Full JSON being sent: %s", string(jsonData))
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	if err != nil {

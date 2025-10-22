@@ -157,7 +157,8 @@ func initFileStates(fileStates map[string]time.Time) {
 				content, err := readFileContent(fullPath)
 				if err == nil {
 					fileCache[fullPath] = content
-					fileLogger.Printf("Cached content for file: %s, Content: %s", filepath.Base(fullPath), truncateBody(content))
+					fileLogger.Printf("Cached content for file: %s, Size: %d bytes, Content: %s",
+						filepath.Base(fullPath), len(content), truncateBody(content))
 				} else {
 					fileLogger.Printf("Error caching file %s: %v", filepath.Base(fullPath), err)
 				}
@@ -212,10 +213,11 @@ func handleFileCreate(filename, steamID string, fileStates map[string]time.Time)
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "add-dino-data",
-		Data:      ensureValidData(content),
+		Data:      content, // Отправляем оригинальное содержимое без изменений
 	}
 
-	fileLogger.Printf("Sending create event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
+	fileLogger.Printf("Sending create event for SteamID %s, File size: %d bytes, Data: %s",
+		steamID, len(content), truncateBody(content))
 	sendEventWithRetry(eventData)
 	fileStates[filename] = time.Now()
 }
@@ -246,10 +248,11 @@ func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) 
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "change-dino-data",
-		Data:      ensureValidData(content),
+		Data:      content, // Отправляем оригинальное содержимое без изменений
 	}
 
-	fileLogger.Printf("Sending change event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
+	fileLogger.Printf("Sending change event for SteamID %s, File size: %d bytes, Data: %s",
+		steamID, len(content), truncateBody(content))
 	sendEventWithRetry(eventData)
 
 	// Обновляем время модификации
@@ -266,10 +269,11 @@ func handleFileRemove(filename, steamID string, fileStates map[string]time.Time)
 		SteamID64: steamID,
 		Type:      "player",
 		Event:     "delete-dino-data",
-		Data:      ensureValidData(content),
+		Data:      content, // Отправляем кэшированное содержимое
 	}
 
-	fileLogger.Printf("Sending delete event for SteamID %s, Data: %s", steamID, truncateBody(eventData.Data))
+	fileLogger.Printf("Sending delete event for SteamID %s, Cached data size: %d bytes, Data: %s",
+		steamID, len(content), truncateBody(content))
 	sendEventWithRetry(eventData)
 
 	// Удаляем из кэша и состояний
@@ -300,11 +304,38 @@ func getSteamIDFromFilename(filename string) string {
 }
 
 func readFileContent(filename string) (string, error) {
+	// Сначала проверяем размер файла
+	info, err := os.Stat(filename)
+	if err != nil {
+		return "", fmt.Errorf("stat error: %v", err)
+	}
+
+	fileLogger.Printf("Reading file: %s, Size: %d bytes", filepath.Base(filename), info.Size())
+
+	// Если файл пустой, возвращаем пустую строку
+	if info.Size() == 0 {
+		fileLogger.Printf("File %s is empty", filepath.Base(filename))
+		return "", nil
+	}
+
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read error: %v", err)
 	}
+
+	// Логируем первые 100 байт для отладки
+	if len(content) > 0 {
+		fileLogger.Printf("File %s first 100 bytes: %q", filepath.Base(filename), string(content[:min(100, len(content))]))
+	}
+
 	return string(content), nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Получаем кэшированное содержимое файла
@@ -312,31 +343,16 @@ func getCachedContent(filename string) string {
 	if content, exists := fileCache[filename]; exists {
 		return content
 	}
-	return "" // Возвращаем пустую строку вместо null
-}
-
-// Гарантируем, что данные всегда будут валидными (не null)
-func ensureValidData(data string) string {
-	// Если данные пустые, возвращаем пустой JSON объект
-	if strings.TrimSpace(data) == "" {
-		return "{}"
-	}
-
-	// Пробуем распарсить как JSON чтобы проверить валидность
-	var js json.RawMessage
-	if err := json.Unmarshal([]byte(data), &js); err != nil {
-		// Если не валидный JSON, логируем ошибку и возвращаем как JSON строку
-		fileLogger.Printf("Data is not valid JSON, wrapping as string. Error: %v, Data: %s", err, truncateBody(data))
-		// Экранируем и возвращаем как JSON строку
-		escapedData := strings.ReplaceAll(data, `"`, `\"`)
-		return `"` + escapedData + `"`
-	}
-
-	// Если валидный JSON, возвращаем как есть
-	return data
+	return "" // Возвращаем пустую строку
 }
 
 func sendEventWithRetry(eventData EventData) {
+	// Если данные пустые, заменяем на пустой JSON объект
+	if eventData.Data == "" {
+		eventData.Data = "{}"
+		fileLogger.Printf("Empty data replaced with empty JSON object for SteamID %s", eventData.SteamID64)
+	}
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		apiResponse := sendEvent(eventData)
 
@@ -360,6 +376,10 @@ func sendEventWithRetry(eventData EventData) {
 }
 
 func sendEvent(eventData EventData) ApiResponse {
+	// Логируем что именно отправляем
+	fileLogger.Printf("Sending event to API: SteamID=%s, Event=%s, Data length=%d",
+		eventData.SteamID64, eventData.Event, len(eventData.Data))
+
 	jsonData, err := json.Marshal(eventData)
 	if err != nil {
 		fileLogger.Printf("Error marshaling JSON: %v", err)
@@ -371,6 +391,9 @@ func sendEvent(eventData EventData) ApiResponse {
 			Error:     fmt.Sprintf("JSON marshal error: %v", err),
 		}
 	}
+
+	// Логируем полный JSON для отладки
+	fileLogger.Printf("Full JSON being sent: %s", string(jsonData))
 
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	if err != nil {

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
-	"fmt"
+	_ "fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,305 +14,256 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Config структура для конфигурации
-type Config struct {
-	WatchPaths  []string `json:"watch_paths"`
-	LogFile     string   `json:"log_file"`
-	MaxFileSize int64    `json:"max_file_size"`
-}
-
-// LogEntry структура для записи лога
-type LogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Event     string    `json:"event"`
-	Filename  string    `json:"filename"`
-	Content   string    `json:"content,omitempty"`
-	Error     string    `json:"error,omitempty"`
-}
-
-var (
-	config  Config
-	logger  *log.Logger
-	logFile *os.File
+const (
+	watchPath     = `C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`
+	apiURL        = "https://admin.twod.club/api/get-event"
+	checkInterval = 2 * time.Second // Интервал проверки изменений
 )
 
+type EventData struct {
+	SteamID64 string `json:"steamid64"`
+	Type      string `json:"type"`
+	Event     string `json:"event"`
+	Data      string `json:"data"`
+}
+
 func main() {
-	// Инициализация конфигурации
-	initConfig()
+	log.Println("Starting file watcher for:", watchPath)
 
-	// Инициализация логгера
-	if err := initLogger(); err != nil {
-		log.Fatal("Ошибка инициализации логгера:", err)
+	// Проверяем существование папки
+	if _, err := os.Stat(watchPath); os.IsNotExist(err) {
+		log.Fatalf("Directory does not exist: %s", watchPath)
 	}
-	defer logFile.Close()
-
-	logger.Println("=== Запуск мониторинга папок ===")
-	for _, path := range config.WatchPaths {
-		logger.Printf("Мониторинг папки: %s\n", path)
-	}
-	logger.Printf("Лог файл: %s\n", config.LogFile)
 
 	// Создаем watcher
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		logger.Fatal("Ошибка создания watcher:", err)
+		log.Fatal("Error creating watcher:", err)
 	}
 	defer watcher.Close()
 
-	// Добавляем все папки для мониторинга
-	for _, watchPath := range config.WatchPaths {
-		// Добавляем основную папку для мониторинга
-		err = watcher.Add(watchPath)
-		if err != nil {
-			logger.Printf("Ошибка добавления папки %s: %v\n", watchPath, err)
-			continue
-		}
-
-		// Также мониторим вложенные папки
-		err = filepath.Walk(watchPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if info.IsDir() {
-				err = watcher.Add(path)
-				if err != nil {
-					logger.Printf("Ошибка добавления подпапки %s: %v\n", path, err)
-				} else {
-					logger.Printf("Добавлена подпапка: %s\n", path)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			logger.Printf("Ошибка обхода папок %s: %v\n", watchPath, err)
-		}
+	// Добавляем папку для отслеживания
+	err = watcher.Add(watchPath)
+	if err != nil {
+		log.Fatal("Error adding watch path:", err)
 	}
 
-	logger.Println("Мониторинг запущен. Ожидание событий...")
-	fmt.Println("Мониторинг запущен. События записываются в:", config.LogFile)
+	log.Println("Watching directory:", watchPath)
 
-	// Обработка событий
+	// Карта для отслеживания предыдущего состояния файлов
+	fileStates := make(map[string]time.Time)
+
+	// Инициализация - сканируем существующие файлы
+	initFileStates(fileStates)
+
+	// Основной цикл обработки событий
 	for {
 		select {
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return
 			}
-
-			// Обрабатываем только файлы (игнорируем папки)
-			if isDirectory(event.Name) {
-				// Если создана новая папка, добавляем её в мониторинг
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					err := watcher.Add(event.Name)
-					if err != nil {
-						logger.Printf("Ошибка добавления новой папки %s: %v\n", event.Name, err)
-					} else {
-						logger.Printf("Добавлена новая папка для мониторинга: %s\n", event.Name)
-					}
-				}
-				continue
-			}
-
-			// Обрабатываем события файлов
-			handleFileEvent(event)
+			handleFileEvent(event, fileStates)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
 			}
-			logger.Println("Ошибка watcher:", err)
+			log.Println("Watcher error:", err)
+
+		case <-time.After(checkInterval):
+			// Периодическая проверка на удаленные файлы
+			checkForDeletedFiles(fileStates)
 		}
 	}
 }
 
-func initConfig() {
-	config = Config{
-		WatchPaths: []string{
-			`C:\EVRIMA\surv_server\TheIsle\Saved\Databases\Survival\Players`,
-		},
-		LogFile:     `C:\EVRIMA\file_monitor.log`,
-		MaxFileSize: 10 * 1024 * 1024, // 10MB максимальный размер файла для чтения
-	}
-
-	// Создаем папки для мониторинга если их нет
-	for _, watchPath := range config.WatchPaths {
-		os.MkdirAll(watchPath, 0755)
-	}
-
-	// Создаем директорию для лог файла если её нет
-	logDir := filepath.Dir(config.LogFile)
-	os.MkdirAll(logDir, 0755)
-}
-
-func initLogger() error {
-	var err error
-	logFile, err = os.OpenFile(config.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func initFileStates(fileStates map[string]time.Time) {
+	files, err := os.ReadDir(watchPath)
 	if err != nil {
-		return err
+		log.Printf("Error reading directory: %v", err)
+		return
 	}
 
-	logger = log.New(logFile, "", log.LstdFlags)
-	return nil
-}
-
-func isDirectory(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
+	for _, file := range files {
+		if !file.IsDir() {
+			fullPath := filepath.Join(watchPath, file.Name())
+			if info, err := os.Stat(fullPath); err == nil {
+				fileStates[fullPath] = info.ModTime()
+			}
+		}
 	}
-	return info.IsDir()
+	log.Printf("Initialized tracking for %d files", len(fileStates))
 }
 
-func handleFileEvent(event fsnotify.Event) {
+func handleFileEvent(event fsnotify.Event, fileStates map[string]time.Time) {
 	filename := event.Name
-	var logEntry LogEntry
 
-	// Добавляем небольшую задержку для обработки файлов, которые могут быть заблокированы
-	time.Sleep(100 * time.Millisecond)
+	// Игнорируем директории
+	if info, err := os.Stat(filename); err == nil && info.IsDir() {
+		return
+	}
+
+	// Получаем steamid из имени файла
+	steamID := getSteamIDFromFilename(filename)
+	if steamID == "" {
+		return
+	}
+
+	log.Printf("Event: %s, File: %s", event.Op.String(), filepath.Base(filename))
 
 	switch {
 	case event.Op&fsnotify.Create == fsnotify.Create:
-		logEntry = LogEntry{
-			Timestamp: time.Now(),
-			Event:     "CREATE",
-			Filename:  filename,
-		}
-		content, err := readFileContent(filename)
-		if err == nil {
-			logEntry.Content = content
-		} else {
-			logEntry.Error = err.Error()
-		}
+		// Небольшая задержка для гарантии что файл полностью записан
+		time.Sleep(100 * time.Millisecond)
+		handleFileCreate(filename, steamID, fileStates)
 
 	case event.Op&fsnotify.Write == fsnotify.Write:
-		logEntry = LogEntry{
-			Timestamp: time.Now(),
-			Event:     "MODIFY",
-			Filename:  filename,
-		}
-		content, err := readFileContent(filename)
-		if err == nil {
-			logEntry.Content = content
-		} else {
-			logEntry.Error = err.Error()
-		}
+		handleFileWrite(filename, steamID, fileStates)
 
 	case event.Op&fsnotify.Remove == fsnotify.Remove:
-		logEntry = LogEntry{
-			Timestamp: time.Now(),
-			Event:     "DELETE",
-			Filename:  filename,
-		}
+		handleFileRemove(filename, steamID, fileStates)
+	}
+}
 
-	case event.Op&fsnotify.Rename == fsnotify.Rename:
-		logEntry = LogEntry{
-			Timestamp: time.Now(),
-			Event:     "RENAME",
-			Filename:  filename,
-		}
+func handleFileCreate(filename, steamID string, fileStates map[string]time.Time) {
+	content, err := readFileContent(filename)
+	if err != nil {
+		log.Printf("Error reading created file %s: %v", filename, err)
+		return
 	}
 
-	// Записываем в лог
-	writeLogEntry(logEntry)
+	eventData := EventData{
+		SteamID64: steamID,
+		Type:      "player",
+		Event:     "add-dino-data",
+		Data:      content,
+	}
+
+	sendEvent(eventData)
+	fileStates[filename] = time.Now()
+}
+
+func handleFileWrite(filename, steamID string, fileStates map[string]time.Time) {
+	// Проверяем, действительно ли файл изменился
+	if info, err := os.Stat(filename); err == nil {
+		if oldTime, exists := fileStates[filename]; exists {
+			if info.ModTime().Equal(oldTime) {
+				return // Файл не изменился
+			}
+		}
+	} else {
+		log.Printf("Error stating file %s: %v", filename, err)
+		return
+	}
+
+	content, err := readFileContent(filename)
+	if err != nil {
+		log.Printf("Error reading modified file %s: %v", filename, err)
+		return
+	}
+
+	eventData := EventData{
+		SteamID64: steamID,
+		Type:      "player",
+		Event:     "change-dino-data",
+		Data:      content,
+	}
+
+	sendEvent(eventData)
+
+	// Обновляем время модификации
+	if info, err := os.Stat(filename); err == nil {
+		fileStates[filename] = info.ModTime()
+	}
+}
+
+func handleFileRemove(filename, steamID string, fileStates map[string]time.Time) {
+	// Для удаленных файлов мы не можем прочитать содержимое,
+	// но можем использовать кэшированное содержимое если оно есть
+	var content string
+	if cachedContent, exists := getCachedContent(filename); exists {
+		content = cachedContent
+	}
+
+	eventData := EventData{
+		SteamID64: steamID,
+		Type:      "player",
+		Event:     "delete-dino-data",
+		Data:      content,
+	}
+
+	sendEvent(eventData)
+	delete(fileStates, filename)
+}
+
+func checkForDeletedFiles(fileStates map[string]time.Time) {
+	for filename := range fileStates {
+		if _, err := os.Stat(filename); os.IsNotExist(err) {
+			// Файл был удален вне событий watcher
+			steamID := getSteamIDFromFilename(filename)
+			if steamID != "" {
+				log.Printf("Detected deleted file: %s", filepath.Base(filename))
+				handleFileRemove(filename, steamID, fileStates)
+			}
+		}
+	}
+}
+
+func getSteamIDFromFilename(filename string) string {
+	base := filepath.Base(filename)
+	ext := filepath.Ext(base)
+	return base[:len(base)-len(ext)]
 }
 
 func readFileContent(filename string) (string, error) {
-	// Проверяем размер файла
-	info, err := os.Stat(filename)
-	if err != nil {
-		return "", err
-	}
-
-	if info.Size() > config.MaxFileSize {
-		return "", fmt.Errorf("файл слишком большой: %d байт", info.Size())
-	}
-
-	// Читаем содержимое файла
 	content, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
-
-	// Если файл пустой, возвращаем пустую строку
-	if len(content) == 0 {
-		return "[EMPTY FILE]", nil
-	}
-
-	// Проверяем, является ли содержимое JSON
-	if isJSON(content) {
-		return formatJSON(content), nil
-	}
-
-	// Для бинарных файлов возвращаем информацию о размере
-	if isBinary(content) {
-		return fmt.Sprintf("[BINARY DATA - %d bytes]", len(content)), nil
-	}
-
 	return string(content), nil
 }
 
-func isJSON(content []byte) bool {
-	var js json.RawMessage
-	return json.Unmarshal(content, &js) == nil
+// Простая кэш-функция для хранения содержимого файлов
+// В реальном приложении можно использовать более сложный кэш
+func getCachedContent(filename string) (string, bool) {
+	// Здесь можно реализовать кэширование содержимого файлов
+	// Для простоты возвращаем пустую строку
+	return "", false
 }
 
-func formatJSON(content []byte) string {
-	var obj interface{}
-	if err := json.Unmarshal(content, &obj); err != nil {
-		return string(content)
-	}
-
-	formatted, err := json.MarshalIndent(obj, "", "  ")
+func sendEvent(eventData EventData) {
+	jsonData, err := json.Marshal(eventData)
 	if err != nil {
-		return string(content)
-	}
-
-	return string(formatted)
-}
-
-func isBinary(content []byte) bool {
-	if len(content) == 0 {
-		return false
-	}
-
-	// Проверяем первые несколько байт на наличие бинарных данных
-	for i := 0; i < len(content) && i < 1024; i++ {
-		if content[i] == 0 {
-			return true
-		}
-	}
-
-	// Проверяем процент печатных символов
-	printable := 0
-	for i := 0; i < len(content) && i < 1024; i++ {
-		if content[i] >= 32 && content[i] <= 126 || content[i] == '\n' || content[i] == '\r' || content[i] == '\t' {
-			printable++
-		}
-	}
-
-	ratio := float64(printable) / float64(min(len(content), 1024))
-	return ratio < 0.8
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func writeLogEntry(entry LogEntry) {
-	jsonData, err := json.Marshal(entry)
-	if err != nil {
-		logger.Printf("Ошибка маршалинга лога: %v\n", err)
+		log.Printf("Error marshaling JSON: %v", err)
 		return
 	}
 
-	logger.Println(string(jsonData))
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Error creating request: %v", err)
+		return
+	}
 
-	// Также выводим в консоль для отладки
-	fmt.Printf("%s [%s] %s\n",
-		entry.Timestamp.Format("2006-01-02 15:04:05"),
-		entry.Event,
-		filepath.Base(entry.Filename))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "FileWatcher/1.0")
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error sending request: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("Successfully sent event %s for SteamID %s", eventData.Event, eventData.SteamID64)
+	} else {
+		log.Printf("Error response from server: %d - %s", resp.StatusCode, string(body))
+	}
 }
